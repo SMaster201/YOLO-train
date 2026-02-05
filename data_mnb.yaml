@@ -1,0 +1,22 @@
+# data.yaml
+path: ./nmosv8_mnb_bmp       # 資料集根目錄
+train: train    # 訓練圖片路徑 (相對於 path)
+val: valid      # 驗證圖片路徑 (相對於 path)
+test: test      # 測試圖片路徑 (相對於 path)，用於評估與推論計時
+
+# 類別數量
+nc: 11
+
+# 類別名稱 (順序必須與 JSON ID 一致)
+names:
+  0: nmos
+  1: nmos_number
+  2: xerror
+  3: xline
+  4: xlinec
+  5: xlinep
+  6: yerror
+  7: yline
+  8: ylinec
+  9: ylinep
+  10: dienumber
