@@ -7,41 +7,65 @@ from pathlib import Path
 from ultralytics import YOLO
 from ultralytics.utils.torch_utils import get_flops
 import wandb
+import os
+
+# 嘗試導入 supervision 與 MeanAverageRecall（mAR 在 supervision.metrics 子模組）
+try:
+    import supervision as sv
+    try:
+        from supervision.metrics import MeanAverageRecall as _MeanAverageRecall
+        _MAR_CLASS = _MeanAverageRecall
+    except AttributeError:
+        _MAR_CLASS = getattr(sv, "MeanAverageRecall", None)
+    SUPERVISION_AVAILABLE = bool(_MAR_CLASS)
+    if SUPERVISION_AVAILABLE:
+        print(f" [Info] Supervision version: {sv.__version__} (mAR 可用)")
+    else:
+        print(" [Warning] Supervision 已安裝但無 MeanAverageRecall，請升級: pip install -U supervision")
+except ImportError:
+    SUPERVISION_AVAILABLE = False
+    _MAR_CLASS = None
+    print(" [Warning] Supervision library not found. pip install supervision for accurate mAR metrics.")
 
 # ================= 設定區 =================
-# 1. 請在這裡設定你的資料設定檔 (data.yaml) 的路徑
-DATA_YAML = 'data_mnb.yaml'
+DATA_YAML = 'data_mosaic.yaml'
 
-# 2. 請將你想測試的所有模型路徑放入此列表 
-# (建議包含 .pt 作為基準，這樣 .engine 才能繼承參數量資訊)
+# 輸入影像尺寸（須與訓練/導出時一致，例如 640 或 768）
+IMGSZ = 768
+
 MODELS_LIST = [
-    # 範例路徑，請修改為你實際的路徑
-    'runs/detect/yolo26_project5/weights/MNB.pt',           # FP32 基準
-    'runs/detect/yolo26_project5/weights/MNB_fp16.engine',  # TensorRT FP16
-    'runs/detect/yolo26_project5/weights/MNB_int8.engine',  # TensorRT INT8
+    'runs/detect/768/yolo26_mosaic_nano/weights/best.pt',
+    'runs/detect/768/yolo26_mosaic_nano/weights/best_fp16.engine',
+    'runs/detect/768/yolo26_mosaic_nano/weights/best_int8.engine',
 
-    'runs/detect/yolo26_Small/weights/MNB.pt',           # FP32 基準
-    'runs/detect/yolo26_Small/weights/MNB_fp16.engine',  # TensorRT FP16
-    'runs/detect/yolo26_Small/weights/MNB_int8.engine',  # TensorRT INT8
+    'runs/detect/768/yolo26_mosaic_small/weights/best.pt',
+    'runs/detect/768/yolo26_mosaic_small/weights/best_fp16.engine',
+    'runs/detect/768/yolo26_mosaic_small/weights/best_int8.engine',
+    
+    'runs/detect/768/yolo26_mosaic_medium/weights/best.pt',
+    'runs/detect/768/yolo26_mosaic_medium/weights/best_fp16.engine',
+    'runs/detect/768/yolo26_mosaic_medium/weights/best_int8.engine',
+    
+    'runs/detect/768/yolo26_mosaic_large/weights/MOSAIC.pt',
+    'runs/detect/768/yolo26_mosaic_large/weights/MOSAIC_fp16.engine',
+    'runs/detect/768/yolo26_mosaic_large/weights/MOSAIC_int8.engine',
 
-    'runs/detect/yolo26_mnb_medium/weights/MNB.pt',           # FP32 基準
-    'runs/detect/yolo26_mnb_medium/weights/MNB_fp16.engine',  # TensorRT FP16
-    'runs/detect/yolo26_mnb_medium/weights/MNB_int8.engine'  # TensorRT INT8
+    'runs/detect/768/yolo26_mosaic_xlarge/weights/MOSAIC.pt',
+    'runs/detect/768/yolo26_mosaic_xlarge/weights/MOSAIC_fp16.engine',
+    'runs/detect/768/yolo26_mosaic_xlarge/weights/MOSAIC_int8.engine',
 ]
 # ========================================
 
 METRICS_HEADERS = [
     '模型名稱', 'Variant', 'Parameters (M)', 'Quantization', 'Precision', 'Recall', 'F1-Score',
-    'Avg Preprocess (s)', 'Avg Inference (s)', 'Avg Postprocess (s)', 'Avg Total (s)',
+    'mAP50', 'mAP50-95', 'mAR50', 'mAR50-95', 
+    'Avg Preprocess (s)', 'Avg Inference (s)', 'Avg Postprocess (s)', 'Avg Total (s)', 'Total Render Time (s)',
     'Avg GFLOPS', 'Save Dir'
 ]
 
-# 用於儲存 FP32 模型的資訊 (GFLOPS, Variant, Parameters)，供量化模型查詢使用
-# Key: (stem, parent_dir) 避免不同目錄的同名 .pt 互相覆蓋；查詢時可 fallback 到單一 stem
 INFO_CACHE = {}
 
 def get_clean_stem(path_str):
-    """移除量化後綴，取得原始模型名稱 (例如 MNB_int8 -> MNB)"""
     stem = Path(path_str).stem
     clean = stem.replace('_fp16', '').replace('_FP16', '') \
                 .replace('_int8', '').replace('_INT8', '') \
@@ -51,123 +75,278 @@ def get_clean_stem(path_str):
     return clean
 
 def determine_model_variant(params_count):
-    """根據參數量判斷模型大小 (Nano/Small/Medium/Large/XLarge)"""
-    # 這裡傳入的是實際數量 (例如 3000000)
     if params_count < 5_000_000: return 'Nano'
     if params_count < 18_000_000: return 'Small'
-    if params_count < 35_000_000: return 'Medium'
+    if params_count < 24_000_000: return 'Medium'
     if params_count < 55_000_000: return 'Large'
     return 'XLarge'
 
 def pre_scan_models_info(models_list, imgsz=640):
-    """
-    預先掃描所有 .pt 檔案，執行 Fuse，計算 GFLOPS、參數量和模型大小並快取。
-    """
     print("正在預先掃描 FP32 模型資訊以校正 GFLOPS 與參數量...")
     for model_path in models_list:
         path = Path(model_path)
-        # 只掃描 .pt 檔，因為 .engine 無法讀取結構
         if path.suffix.lower() == '.pt' and path.exists():
             try:
                 model = YOLO(str(path))
-                
-                # ============================================
-                # [關鍵修正] 強制執行層融合 (Fuse Conv+BN)
-                # 這會讓參數統計符合「推論狀態」，數值會比訓練時略少
-                # ============================================
-                print(f"  [Info] 正在融合模型層 (Fusing) 以取得推論參數: {path.name}")
-                try:
-                    model.fuse()
-                except Exception as fe:
-                    print(f"  [Warn] Fuse 失敗 (可能是已經融合過或不支援): {fe}")
+                print(f"  [Info] 正在融合模型層 (Fusing): {path.name}")
+                try: model.fuse()
+                except Exception: pass
 
                 stem = get_clean_stem(path)
                 parent_dir = str(path.parent.resolve())
                 
-                # 1. 計算 GFLOPS (基於融合後的模型)
                 gflops = 0.0
                 try:
                     if hasattr(model, 'model'):
                         gflops = get_flops(model.model, imgsz)
                 except: pass
                 
-                # 2. 計算參數量 (Parameters)
                 params_count = 0
                 try:
                     params_count = sum(p.numel() for p in model.model.parameters())
                 except: pass
                 
-                # 3. 判斷 Variant
                 variant = determine_model_variant(params_count)
                 
-                # 存入快取：用 (stem, parent_dir) 當 key，避免不同目錄的同名 FP32 互相覆蓋
                 entry = {
                     'gflops': round(gflops, 4),
                     'variant': variant,
-                    'params': round(params_count / 1e6, 2) # Store as Millions
+                    'params': round(params_count / 1e6, 2)
                 }
                 INFO_CACHE[(stem, parent_dir)] = entry
-                # 若此 stem 尚未有「僅 stem」的 fallback，也存一份（僅在第一次出現時）
                 if stem not in INFO_CACHE:
                     INFO_CACHE[stem] = entry
-                # print(f"  -> {stem}: {variant}, {entry['params']}M params (Fused)")
             except Exception as e:
                 print(f"  [Skip] 無法讀取 {path.name}: {e}")
     print("預掃描完成。\n")
 
-def get_test_path_from_yaml(yaml_path):
-    """從 data.yaml 取得測試集路徑"""
-    try:
-        yaml_path = Path(yaml_path)
-        with open(yaml_path, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
-        root = data.get('path', '.')
-        root_path = Path(root) if Path(root).is_absolute() else yaml_path.parent / root
-        test_rel = data.get('test', 'test')
-        test_path = root_path / (test_rel if isinstance(test_rel, str) else 'test')
-        if test_path.exists() and test_path.is_dir():
-            return str(test_path.resolve())
-        return None
-    except Exception:
-        return None
-
-def get_image_count_from_yaml(yaml_path, split='test'):
-    """從 data.yaml 讀取測試集路徑並強制計算圖片數量"""
-    count = 0
+def get_dataset_paths_from_yaml(yaml_path, split='test'):
+    """解析 YAML 並嘗試推斷 images 和 labels 資料夾路徑（支援兩種結構）"""
     try:
         yaml_path = Path(yaml_path)
         with open(yaml_path, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
         
-        path_str = data.get(split)
-        if not path_str and split == 'test':
-            path_str = 'test'
-        if not path_str:
-            return 0
-        root = data.get('path', '.')
-        root_path = Path(root) if Path(root).is_absolute() else yaml_path.parent / root
-        dataset_path = root_path / path_str if not Path(path_str).is_absolute() else Path(path_str)
-        if not dataset_path.exists():
-            dataset_path = yaml_path.parent / path_str
-
-        if dataset_path.exists() and dataset_path.is_dir():
-            exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
-            count = len([x for x in dataset_path.rglob('*') if x.suffix.lower() in exts])
-        elif dataset_path.suffix == '.txt':
-             with open(dataset_path, 'r') as f:
-                 count = len(f.readlines())
+        path_root = data.get('path', '.')
+        root_path = Path(path_root) if Path(path_root).is_absolute() else yaml_path.parent / path_root
+        
+        rel_path = data.get(split, 'test')
+        if isinstance(rel_path, list): rel_path = rel_path[0]
+            
+        images_path = root_path / rel_path if not Path(rel_path).is_absolute() else Path(rel_path)
+        
+        if not images_path.exists():
+            return None, None
+        
+        # 策略 1: 檢查是否為標準 YOLO 結構 (images/train <-> labels/train)
+        if 'images' in str(images_path):
+            labels_path = Path(str(images_path).replace('images', 'labels'))
+            if labels_path.exists():
+                return images_path, labels_path
+        
+        # 策略 2: 檢查是否有獨立的 labels 目錄 (dataset/labels/train)
+        labels_path_alt = root_path / 'labels' / rel_path
+        if labels_path_alt.exists():
+            return images_path, labels_path_alt
+        
+        # 策略 3: 圖片和標籤在同一目錄（簡化結構，test/ 同時有 .bmp 和 .txt）
+        # 檢查該目錄是否有 .txt 標籤文件
+        txt_files = list(images_path.glob('*.txt'))
+        if txt_files:
+            # 同一目錄，返回相同路徑
+            return images_path, images_path
+        
+        # 策略 4: 嘗試平級 labels 目錄
+        labels_path_fallback = images_path.parent.parent / 'labels' / images_path.name
+        if labels_path_fallback.exists():
+            return images_path, labels_path_fallback
+        
+        # 都找不到，返回 images_path 和 None（讓 Supervision 嘗試從同目錄讀取）
+        return images_path, None
+        
     except Exception as e:
-        print(f"警告：計算圖片數量時發生錯誤 ({e})")
-    return count if count > 0 else 0
+        print(f" [Warning] YAML 解析路徑失敗: {e}")
+        return None, None
 
-def get_quantization_label(model_path):
-    path = str(Path(model_path).name).lower()
-    if 'int8' in path or 'quantized' in path or 'tflite' in path: return 'INT8'
-    if 'half' in path or 'fp16' in path: return 'FP16'
-    return 'FP32'
 
-def evaluate_single_model(model_path, data_yaml='data.yaml', warmup=5, repeat=20):
-    """執行評估單一模型並計算所有數值"""
+def _empty_detections():
+    """回傳空的 sv.Detections（相容各版 supervision）。"""
+    try:
+        return sv.Detections.empty()
+    except AttributeError:
+        return sv.Detections(
+            xyxy=np.empty((0, 4), dtype=np.float32),
+            class_id=np.array([], dtype=int)
+        )
+
+
+def _load_yolo_labels_to_detections(label_path, img_w, img_h, encoding='utf-8'):
+    """從 YOLO 格式 .txt 讀取標註並轉為 sv.Detections（xyxy, class_id）。"""
+    if not Path(label_path).exists():
+        return _empty_detections()
+    try:
+        with open(label_path, 'r', encoding=encoding, errors='replace') as f:
+            lines = [L.strip() for L in f if L.strip()]
+    except Exception:
+        return _empty_detections()
+    if not lines:
+        return _empty_detections()
+    xyxy_list = []
+    class_ids = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            clsid = int(parts[0])
+            xc, yc, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+        except (ValueError, IndexError):
+            continue
+        x1 = (xc - w / 2) * img_w
+        y1 = (yc - h / 2) * img_h
+        x2 = (xc + w / 2) * img_w
+        y2 = (yc + h / 2) * img_h
+        xyxy_list.append([x1, y1, x2, y2])
+        class_ids.append(clsid)
+    if not xyxy_list:
+        return _empty_detections()
+    return sv.Detections(
+        xyxy=np.array(xyxy_list, dtype=np.float32),
+        class_id=np.array(class_ids, dtype=int)
+    )
+
+
+def _load_mar_dataset_manual(images_dir, labels_dir, data_yaml, ext=('.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff')):
+    """手動載入圖片與 YOLO 標籤（全程 UTF-8），回傳 (images, targets) 列表。"""
+    images_dir = Path(images_dir)
+    labels_dir = Path(labels_dir) if labels_dir else images_dir
+    try:
+        with open(data_yaml, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+        nc = int(data.get('nc', 0))
+    except Exception:
+        nc = 0
+    try:
+        import cv2
+    except ImportError:
+        from PIL import Image
+        def _read_size(p):
+            im = Image.open(p)
+            return im.size[0], im.size[1]
+    else:
+        def _read_size(p):
+            im = cv2.imread(str(p))
+            return (im.shape[1], im.shape[0]) if im is not None else (IMGSZ, IMGSZ)
+    pairs = []
+    for img_path in sorted(images_dir.iterdir()):
+        if img_path.suffix.lower() not in ext:
+            continue
+        label_path = labels_dir / (img_path.stem + '.txt')
+        w, h = _read_size(img_path)
+        target = _load_yolo_labels_to_detections(label_path, w, h, encoding='utf-8')
+        # 讀取影像供後續推理（路徑傳給 model 即可，這裡只建 target 列表）
+        pairs.append((str(img_path), target))
+    return pairs
+
+
+def calculate_mar_supervision(model, data_yaml):
+    """使用 Supervision 計算 mAR50 和 mAR50-95（API: supervision.metrics.MeanAverageRecall）"""
+    if not SUPERVISION_AVAILABLE or _MAR_CLASS is None:
+        return None, None
+
+    print(" [Supervision] 正在啟動 mAR 計算流程 (這可能需要一點時間)...")
+    images_dir, labels_dir = get_dataset_paths_from_yaml(data_yaml, split='test')
+    
+    if not images_dir or not images_dir.exists():
+        print(" [Supervision] 找不到影像目錄，跳過 mAR 計算。")
+        return None, None
+    
+    # 使用 supervision.metrics.MeanAverageRecall（內建 IoU 0.5~0.95）
+    metric = _MAR_CLASS()
+
+    dataset = None
+    use_manual_load = False
+    try:
+        if labels_dir and labels_dir.exists() and labels_dir == images_dir:
+            dataset = sv.DetectionDataset.from_yolo(
+                images_directory_path=str(images_dir),
+                annotations_directory_path=str(images_dir),
+                data_yaml_path=str(data_yaml)
+            )
+        elif labels_dir and labels_dir.exists():
+            dataset = sv.DetectionDataset.from_yolo(
+                images_directory_path=str(images_dir),
+                annotations_directory_path=str(labels_dir),
+                data_yaml_path=str(data_yaml)
+            )
+        else:
+            dataset = sv.DetectionDataset.from_yolo(
+                images_directory_path=str(images_dir),
+                annotations_directory_path=str(images_dir),
+                data_yaml_path=str(data_yaml)
+            )
+    except (UnicodeDecodeError, UnicodeError) as e:
+        print(f" [Supervision] 編碼錯誤 (cp950)，改用手動載入 (UTF-8): {e}")
+        use_manual_load = True
+    except Exception as e:
+        print(f" [Supervision] 數據集載入失敗: {e}")
+        return None, None
+
+    if use_manual_load:
+        dataset = None
+
+    predictions_list = []
+    targets_list = []
+
+    if use_manual_load or dataset is None:
+        try:
+            pairs = _load_mar_dataset_manual(images_dir, labels_dir or images_dir, data_yaml)
+        except Exception as e:
+            print(f" [Supervision] 手動載入數據集失敗: {e}")
+            return None, None
+        if not pairs:
+            print(" [Supervision] 手動載入後無有效樣本。")
+            return None, None
+        print(f" [Supervision] 正在對 {len(pairs)} 張影像進行推理 (手動載入)...")
+        for img_path, target in pairs:
+            results = model(img_path, imgsz=IMGSZ, verbose=False)
+            result = results[0]
+            detections = sv.Detections.from_ultralytics(result)
+            predictions_list.append(detections)
+            targets_list.append(target)
+    else:
+        print(f" [Supervision] 正在對 {len(dataset)} 張影像進行推理...")
+        for img_name, image, target in dataset:
+            results = model(image, imgsz=IMGSZ, verbose=False)
+            result = results[0]
+            detections = sv.Detections.from_ultralytics(result)
+            predictions_list.append(detections)
+            targets_list.append(target)
+
+    print(" [Supervision] 正在計算指標...")
+    metric.update(predictions_list, targets_list)
+    res = metric.compute()
+
+    # recall_per_class: (num_classes, num_iou_thresholds), iou_thresholds 通常為 0.5, 0.55, ..., 0.95
+    recall_per_class = getattr(res, "recall_per_class", None)
+    if recall_per_class is None or recall_per_class.size == 0:
+        # fallback: 新 API 的 recall_scores 為 mAR@1, mAR@10, mAR@100，取 mAR@100 當近似
+        rs = getattr(res, "recall_scores", None)
+        if rs is not None and len(rs) > 0:
+            val_mar50_95 = val_mar50 = float(np.mean(rs))
+            print(f" [Supervision] mAR@50: {val_mar50:.4f}, mAR@50-95: {val_mar50_95:.4f} (fallback)")
+            return val_mar50, val_mar50_95
+        return None, None
+    recall_per_class = np.asarray(recall_per_class)
+    # mAR@50 = 平均 recall at IoU 0.5 (第一欄)
+    val_mar50 = float(np.mean(recall_per_class[:, 0]))
+    # mAR@50-95 = 全閾值平均
+    val_mar50_95 = float(np.mean(recall_per_class))
+
+    print(f" [Supervision] mAR@50: {val_mar50:.4f}, mAR@50-95: {val_mar50_95:.4f}")
+    return val_mar50, val_mar50_95
+
+def evaluate_single_model(model_path, data_yaml='data.yaml'):
     model_path = str(model_path)
     model_name = Path(model_path).name
     clean_stem = get_clean_stem(model_name)
@@ -176,43 +355,25 @@ def evaluate_single_model(model_path, data_yaml='data.yaml', warmup=5, repeat=20
     try:
         model = YOLO(model_path)
     except Exception as e:
-        print(f"無法載入模型: {e}")
-        return None
+        print(f"無法載入模型: {e}"); return None
 
-    # 1. 取得測試集圖片總數
-    total_images = get_image_count_from_yaml(data_yaml, split='test')
-    if total_images == 0:
-        print("警告: 找不到測試集圖片，數據可能不準確。")
-
-    # 2. 執行驗證 (model.val)
-    save_dir = None
+    # 1. 執行 Ultralytics 標準驗證 (獲取 mAP, Speed, Confusion Matrix)
     try:
-        result = model.val(data=data_yaml, verbose=False)
-        if hasattr(result, 'save_dir'):
-            save_dir = result.save_dir
-        
+        result = model.val(data=data_yaml, imgsz=IMGSZ, verbose=False, save_json=True)
+        save_dir = getattr(result, 'save_dir', None)
         metrics = getattr(result, 'metrics', result)
         box = metrics.box
         
-        precision = float(box.mp) if hasattr(box, 'mp') else 0.0
-        recall = float(box.mr) if hasattr(box, 'mr') else 0.0
-        map50_95 = float(box.map) if hasattr(box, 'map') else 0.0 
-        
-        if hasattr(box, 'f1') and getattr(box, 'f1', None) is not None and len(box.f1) > 0:
-            f1 = float(np.mean(box.f1))
-        elif (precision + recall) > 0:
-            f1 = 2 * precision * recall / (precision + recall)
-        else:
-            f1 = 0.0
+        precision = float(box.mp)
+        recall = float(box.mr)
+        map50 = float(box.map50)
+        map50_95 = float(box.map)
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-        total_tp = 0
-        total_fp = 0
-        total_fn = 0
+        # 混淆矩陣
+        total_tp = total_fp = total_fn = 0
         per_class = []
-        
         cm = getattr(result, 'confusion_matrix', None)
-        names = result.names
-        
         if cm and hasattr(cm, 'matrix'):
             mat = np.array(cm.matrix)
             nc = mat.shape[0] - 1
@@ -220,137 +381,59 @@ def evaluate_single_model(model_path, data_yaml='data.yaml', warmup=5, repeat=20
                 total_tp = int(np.diag(mat[:nc, :nc]).sum())
                 total_fp = int(mat[:nc, nc].sum()) 
                 total_fn = int(mat[nc, :nc].sum())
-            
-            nt_per_class = getattr(metrics, 'nt_per_class', None)
-            for c in range(nc):
-                gt = int(nt_per_class[c]) if (nt_per_class is not None and c < len(nt_per_class)) else 0
-                matched = int(mat[c, c])
-                fp_c = int(mat[:, c].sum()) - matched
-                pred_c = matched + fp_c
-                p_c = matched / pred_c if pred_c > 0 else 0.0
-                r_c = matched / gt if gt > 0 else 0.0
-                name = names.get(c, str(c))
-                per_class.append({
-                    'class_id': c, 'name': name, 'gt': gt, 'pred': pred_c,
-                    'matched': matched, 'precision': p_c, 'recall': r_c
-                })
-
-        total_predictions = total_tp + total_fp
-        avg_pred_objects = round(total_predictions / total_images, 2) if total_images > 0 else 0.0
-        total_gt = total_tp + total_fn
-        if total_gt > 0:
-            count_error = abs(total_predictions - total_gt) / total_gt
-            avg_count_accuracy = max(0.0, 1.0 - count_error)
-        else:
-            avg_count_accuracy = 0.0
-        avg_iou_accuracy = map50_95
+                nt_per_class = getattr(metrics, 'nt_per_class', [0]*nc)
+                for c in range(nc):
+                    gt = int(nt_per_class[c])
+                    matched = int(mat[c, c])
+                    pred_c = matched + int(mat[:nc, c].sum()) - matched
+                    per_class.append({'class_id': c, 'name': result.names.get(c, str(c)), 'gt': gt, 'matched': matched, 'precision': matched/pred_c if pred_c>0 else 0, 'recall': matched/gt if gt>0 else 0})
+        
+        avg_count_accuracy = max(0.0, 1.0 - (abs((total_tp+total_fp) - (total_tp+total_fn)) / (total_tp+total_fn))) if (total_tp+total_fn) > 0 else 0.0
 
     except Exception as e:
-        print(f"驗證計算失敗: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+        print(f"驗證計算失敗: {e}"); return None
 
-    # 3. 時間計算
-    speed = getattr(result, 'speed', {})
-    inference_ms = speed.get('inference', 0.0)
-    preprocess_ms = speed.get('preprocess', 0.0)
-    postprocess_ms = speed.get('postprocess', 0.0)
-    avg_inf_sec = inference_ms / 1000.0
-    avg_pre_sec = preprocess_ms / 1000.0
-    avg_post_sec = postprocess_ms / 1000.0
-    avg_total_sec = avg_pre_sec + avg_inf_sec + avg_post_sec
-    
-    # 若 Val 沒有回傳時間，則手動測量 (通常 engine 需要這個)
-    if avg_inf_sec < 0.00001:
+    # 2. 計算 mAR (使用 Supervision)
+    mar50, mar50_95 = None, None
+    if SUPERVISION_AVAILABLE:
         try:
-            source = get_test_path_from_yaml(data_yaml)
-            if not source:
-                with open(data_yaml, 'r') as f:
-                    d = yaml.safe_load(f)
-                    root = Path(d.get('path', '.'))
-                    source = str(root / 'test')
-            
-            if source and Path(source).exists():
-                print("  正在手動測量推論速度 (End-to-End)...")
-                # Warmup
-                for _ in range(warmup):
-                    list(model.predict(source=source, verbose=False, max_det=1))
-                # Benchmark
-                t0 = time.perf_counter()
-                for _ in range(repeat):
-                    list(model.predict(source=source, verbose=False))
-                total_duration = time.perf_counter() - t0
-                avg_total_sec = total_duration / repeat
-                avg_inf_sec = avg_total_sec 
-                avg_pre_sec = 0.0
-                avg_post_sec = 0.0
-        except Exception:
-            pass
+            mar50, mar50_95 = calculate_mar_supervision(model, data_yaml)
+        except Exception as e:
+            print(f" [Error] Supervision mAR 計算失敗: {e}")
 
-    # 4. GFLOPS, Params 與 Variant 處理（先依「同目錄」對應的 FP32 查詢，避免被其他 FP32 覆蓋）
-    gflops = 0.0
-    params_m = 0.0
-    variant = 'unknown'
+    # 如果 Supervision 失敗或沒安裝，使用 fallback (注意：Ultralytics 預設不提供 mAR50-95)
+    if mar50 is None: mar50 = recall # Fallback to Recall@0.5
+    if mar50_95 is None: mar50_95 = 0.0 # Fallback to 0 to indicate missing data
+
+    # 3. 時間與輔助資訊
+    speed = getattr(result, 'speed', {})
+    avg_pre_sec, avg_inf_sec, avg_post_sec = speed.get('preprocess', 0)/1000, speed.get('inference', 0)/1000, speed.get('postprocess', 0)/1000
+    avg_total_sec = avg_pre_sec + avg_inf_sec + avg_post_sec
+    total_images = getattr(metrics, 'n_img', 0) or 0
+    if total_images == 0:
+        img_dir, _ = get_dataset_paths_from_yaml(data_yaml, split='test')
+        if img_dir and img_dir.exists():
+            exts = {'.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.webp'}
+            total_images = sum(1 for p in img_dir.iterdir() if p.suffix.lower() in exts)
+
+    # 處理 GFLOPS / Params Cache
     parent_dir = str(Path(model_path).parent.resolve())
-    cache_key_same_dir = (clean_stem, parent_dir)
-    
-    def get_cached_info():
-        if cache_key_same_dir in INFO_CACHE:
-            return INFO_CACHE[cache_key_same_dir]
-        if clean_stem in INFO_CACHE:
-            return INFO_CACHE[clean_stem]
-        return None
-    
-    cached = get_cached_info()
-    
-    if Path(model_path).suffix.lower() == '.pt':
-        # 如果是 .pt，優先使用同目錄的 Cache（Fuse 過的）；沒有再用現場計算
-        if cached:
-            gflops = cached['gflops']
-            variant = cached['variant']
-            params_m = cached['params']
-        else:
-            try:
-                if hasattr(model, 'model'):
-                    gflops = get_flops(model.model, 640) / 1e9
-                    p_count = sum(p.numel() for p in model.model.parameters())
-                    params_m = round(p_count / 1e6, 2)
-                    variant = determine_model_variant(p_count)
-            except: pass
-    else:
-        # engine/int8：只從 cache 找（同目錄 FP32 優先）
-        if cached:
-            gflops = cached['gflops']
-            variant = cached['variant']
-            params_m = cached['params']
-        else:
-            variant = 'unknown'
-            gflops = 0.0
-            params_m = 0.0
+    cached = INFO_CACHE.get((clean_stem, parent_dir), INFO_CACHE.get(clean_stem))
+    gflops = cached['gflops'] if cached else 0.0
+    params_m = cached['params'] if cached else 0.0
+    variant = cached['variant'] if cached else 'unknown'
 
     return {
-        '模型名稱': model_name,
-        'Variant': variant, 
-        'Parameters (M)': params_m, 
-        'Quantization': get_quantization_label(model_path),
-        'Precision': precision,
-        'Recall': recall,
-        'F1-Score': f1,
-        'Avg Preprocess (s)': avg_pre_sec,
-        'Avg Inference (s)': avg_inf_sec,
-        'Avg Postprocess (s)': avg_post_sec,
-        'Avg Total (s)': avg_total_sec,
-        'Avg GFLOPS': gflops,
-        'save_dir': save_dir,
-        'total_images': total_images,
-        'total_tp': total_tp,
-        'total_fp': total_fp,
-        'total_fn': total_fn,
-        'per_class': per_class,
-        'avg_pred_objects': avg_pred_objects,
-        'avg_iou_accuracy': avg_iou_accuracy,
-        'avg_count_accuracy': avg_count_accuracy
+        '模型名稱': model_name, 'Variant': variant, 'Parameters (M)': params_m, 
+        'Quantization': 'INT8' if 'int8' in model_name.lower() else ('FP16' if 'fp16' in model_name.lower() else 'FP32'),
+        'Precision': precision, 'Recall': recall, 'F1-Score': f1,
+        'mAP50': map50, 'mAP50-95': map50_95, 
+        'mAR50': mar50, 'mAR50-95': mar50_95, 
+        'Avg Preprocess (s)': avg_pre_sec, 'Avg Inference (s)': avg_inf_sec, 'Avg Postprocess (s)': avg_post_sec, 
+        'Avg Total (s)': avg_total_sec, 'Total Render Time (s)': avg_total_sec * total_images,
+        'Avg GFLOPS': gflops, 'save_dir': save_dir, 'total_images': total_images,
+        'total_tp': total_tp, 'total_fp': total_fp, 'total_fn': total_fn, 
+        'per_class': per_class, 'avg_count_accuracy': avg_count_accuracy
     }
 
 def save_summary_txt(row):
@@ -365,139 +448,71 @@ def save_summary_txt(row):
     filename = f"{clean_stem}_{variant}_{quant}_{timestamp}_summary.txt"
     filepath = output_dir / filename
     
-    total_images = row['total_images']
-    
-    def fmt(v, decimals=3, percent=False):
-        if v is None: return '0.000'
-        if percent: return f'{v*100:.1f}%'
-        return f'{v:.{decimals}f}'
+    fmt = lambda v, d=3: f"{v:.{d}f}"
+    mar95_str = fmt(row['mAR50-95']) if row['mAR50-95'] > 0 else "N/A"
 
     lines = [
-        f'Evaluation Summary for: {row["模型名稱"]}',
-        '============================================================',
-        f'Total images: {total_images}',
-        f'Total TP: {row["total_tp"]}, FP: {row["total_fp"]}, FN: {row["total_fn"]}',
-        f'Precision: {fmt(row["Precision"])}',
-        f'Recall: {fmt(row["Recall"])}',
-        f'F1-Score: {fmt(row["F1-Score"])}',
-        '',
-        'Model Details:',
-        f'  Variant: {row["Variant"]}',
-        f'  Parameters (Inference): {fmt(row["Parameters (M)"], 2)} M (Fused)',
-        f'  Quantization: {row["Quantization"]}',
-        f'  Avg estimated performance: {fmt(row["Avg GFLOPS"], 2)} GFLOPS',
-        '',
-        'Speed / Latency Breakdown (per image):',
-        f'  Preprocess:  {fmt(row["Avg Preprocess (s)"]*1000, 2)} ms',
-        f'  Inference:   {fmt(row["Avg Inference (s)"]*1000, 2)} ms',
-        f'  Postprocess: {fmt(row["Avg Postprocess (s)"]*1000, 2)} ms',
-        f'  Total Time:  {fmt(row["Avg Total (s)"]*1000, 2)} ms',
-        '',
-        '[Section 1] IoU-Based Matching Statistics:',
-        f'  Avg IoU Accuracy: {fmt(row["avg_iou_accuracy"], 3)} (based on mAP@50-95)',
-        '',
-        '[Section 2] Count-Based Statistics:',
-        f'  Avg Count Accuracy: {fmt(row["avg_count_accuracy"], 1, percent=True)}',
-        '',
-        'Per-Class Summary:',
+        f"Evaluation Summary for: {row['模型名稱']}",
+        "============================================================",
+        f"Total images: {row['total_images']}",
+        f"mAP@50: {fmt(row['mAP50'])} | mAP@50-95: {fmt(row['mAP50-95'])}",
+        f"mAR@50: {fmt(row['mAR50'])} | mAR@50-95: {mar95_str}",
+        f"Precision: {fmt(row['Precision'])} | Recall: {fmt(row['Recall'])} | F1: {fmt(row['F1-Score'])}",
+        "",
+        "Speed / Latency Breakdown (ms):",
+        f"  Preprocess:  {fmt(row['Avg Preprocess (s)']*1000, 2)} ms",
+        f"  Inference:   {fmt(row['Avg Inference (s)']*1000, 2)} ms", 
+        f"  Postprocess: {fmt(row['Avg Postprocess (s)']*1000, 2)} ms",
+        f"  Total Avg:   {fmt(row['Avg Total (s)']*1000, 2)} ms",
+        f"Dataset Total Time: {fmt(row['Total Render Time (s)'], 2)} s",
+        "",
+        "Model Details:",
+        f"  Variant: {row['Variant']} | Params: {row['Parameters (M)']} M | GFLOPS: {row['Avg GFLOPS']}",
+        "============================================================"
     ]
     
-    for pc in row['per_class']:
-        lines.append(
-            f'  Class {pc["class_id"]} ({pc["name"]}): '
-            f'GT={pc["gt"]} Pred={pc["pred"]} Matched={pc["matched"]} '
-            f'P={pc["precision"]:.3f} R={pc["recall"]:.3f}'
-        )
-
-    try:
-        filepath.write_text('\n'.join(lines), encoding='utf-8')
-        print(f"  [v] 已儲存 TXT 報告至: {filepath}")
-    except Exception as e:
-        print(f"  [x] 儲存 TXT 失敗: {e}")
+    filepath.write_text('\n'.join(lines), encoding='utf-8')
+    print(f" [v] 本地文檔已儲存: {filepath.name}")
 
 def save_all_metrics_csv(rows, filepath='all_models_benchmark.csv'):
-    filepath = Path(filepath)
     with open(filepath, 'w', newline='', encoding='utf-8-sig') as f:
-        w = csv.writer(f)
-        w.writerow(METRICS_HEADERS)
+        w = csv.writer(f); w.writerow(METRICS_HEADERS)
         for r in rows:
-            save_dir_str = str(r['save_dir']) if r['save_dir'] else "N/A"
             w.writerow([
                 r['模型名稱'], r['Variant'], r['Parameters (M)'], r['Quantization'], 
                 f"{r['Precision']:.6f}", f"{r['Recall']:.6f}", f"{r['F1-Score']:.6f}",
+                f"{r['mAP50']:.6f}", f"{r['mAP50-95']:.6f}",
+                f"{r['mAR50']:.6f}", f"{r['mAR50-95']:.6f}", 
                 f"{r['Avg Preprocess (s)']:.6f}", f"{r['Avg Inference (s)']:.6f}", 
-                f"{r['Avg Postprocess (s)']:.6f}", f"{r['Avg Total (s)']:.6f}",
-                f"{r['Avg GFLOPS']:.4f}", save_dir_str
+                f"{r['Avg Postprocess (s)']:.6f}", f"{r['Avg Total (s)']:.6f}", f"{r['Total Render Time (s)']:.6f}",
+                f"{r['Avg GFLOPS']:.4f}", str(r['save_dir'])
             ])
-    print(f"\n已儲存總表 CSV: {filepath.absolute()}")
-
-def print_metrics_table(rows):
-    headers = ['Model', 'Var', 'Params(M)', 'Quant', 'Prec', 'Recall', 'F1', 'Total(ms)', 'SaveDir']
-    print("\n" + "=" * 125)
-    print(f"{headers[0]:<20} | {headers[1]:<6} | {headers[2]:<9} | {headers[3]:<6} | {headers[4]:<7} | {headers[5]:<7} | {headers[6]:<7} | {headers[7]:<9} | {headers[8]}")
-    print("-" * 125)
-    for r in rows:
-        sd = str(r['save_dir'].name) if r['save_dir'] else "N/A"
-        total_ms = r['Avg Total (s)'] * 1000
-        print(f"{r['模型名稱']:<20} | {r['Variant']:<6} | {r['Parameters (M)']:<9.2f} | {r['Quantization']:<6} | {r['Precision']:.4f}  | {r['Recall']:.4f}  | {r['F1-Score']:.4f}  | {total_ms:.2f} ms   | {sd}")
-    print("=" * 125)
 
 if __name__ == '__main__':
-    # 程式／環境資訊（上傳到 W&B）
-    try:
-        import ultralytics
-        ultralytics_version = getattr(ultralytics, "__version__", "?")
-    except Exception:
-        ultralytics_version = "?"
-    program_info = {
-        "data_yaml": DATA_YAML,
-        "models": MODELS_LIST,
-        "python_version": sys.version.split()[0],
-        "platform": sys.platform,
-        "ultralytics_version": ultralytics_version,
-        "script": str(Path(__file__).resolve().name),
-        "script_dir": str(Path(__file__).resolve().parent),
-    }
-
-    # 初始化 Weights & Biases 專案
-    wandb.init(
-        project="yolo26-eval",  # 可以改成你自己的專案名稱
-        name=time.strftime("%Y%m%d_%H%M%S"),
-        config=program_info,
-    )
-
-    # Step 0: 預先掃描 FP32 模型以建立 Info Cache (含 Fuse)
-    pre_scan_models_info(MODELS_LIST)
-
+    wandb.init(project="yolo26-eval", name=time.strftime("%Y%m%d_%H%M%S"))
+    pre_scan_models_info(MODELS_LIST, imgsz=IMGSZ)
     all_results = []
-    print(f"準備測試 {len(MODELS_LIST)} 個模型...")
-    
     for model_path in MODELS_LIST:
-        if not Path(model_path).exists():
-            print(f"錯誤: 找不到檔案 {model_path}，跳過。")
-            continue
-            
+        if not Path(model_path).exists(): continue
         row = evaluate_single_model(model_path, data_yaml=DATA_YAML)
-        
         if row:
             save_summary_txt(row)
             all_results.append(row)
-
-            # 上傳到 W&B：Variant、模型名稱、參數量、計算量、渲染時間
             wandb.log({
-                "model_name": row["模型名稱"],
-                "variant": row["Variant"],
-                "params_M": row["Parameters (M)"],
-                "gflops": row["Avg GFLOPS"],
-                "render_time_s": row["Avg Total (s)"],
+                "model/name": row["模型名稱"],
+                "model/variant": row["Variant"],
+                "model/params_M": row["Parameters (M)"],
+                "model/gflops": row["Avg GFLOPS"],
+                "metrics/mAP50": row["mAP50"],
+                "metrics/mAP50-95": row["mAP50-95"],
+                "metrics/mAR50": row["mAR50"],
+                "metrics/mAR50-95": row["mAR50-95"],
+                "metrics/f1_score": row["F1-Score"],
+                "latency/preprocess_ms": row["Avg Preprocess (s)"] * 1000,
+                "latency/inference_ms": row["Avg Inference (s)"] * 1000,
+                "latency/postprocess_ms": row["Avg Postprocess (s)"] * 1000,
+                "latency/total_avg_ms": row["Avg Total (s)"] * 1000,
+                "latency/total_render_time_s": row["Total Render Time (s)"], 
             })
-        else:
-            print(f"模型 {model_path} 評估失敗。")
-
-    if all_results:
-        save_all_metrics_csv(all_results)
-        print_metrics_table(all_results)
-    else:
-        print("沒有產生任何有效結果。")
-
+    if all_results: save_all_metrics_csv(all_results)
     wandb.finish()
